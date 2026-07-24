@@ -1,192 +1,168 @@
 #!/usr/bin/env python3
-"""Dunelm single-product stock monitor.
-
-Conservative detection: only reports in stock when a recognised positive
-purchase/availability signal is present. Unknown pages cause the workflow to
-fail rather than generating a false restock alert.
-"""
 from __future__ import annotations
-
-import json
-import os
-import re
-import sys
-import time
-from html import unescape
+import json, os, re, sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-VERSION = "DUNELM-MONITOR-V1"
+VERSION = "DUNELM-MONITOR-PLAYWRIGHT-V2"
 CONFIG_PATH = Path("config.json")
 STATE_PATH = Path("state.json")
+DIAG_DIR = Path("diagnostics")
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def save_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def fetch(url: str, attempts: int = 3) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/138.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-GB,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
+def send_discord(webhook: str, content: str, username: str) -> None:
+    body = json.dumps({"username": username, "content": content}).encode()
+    req = Request(webhook, data=body, method="POST", headers={"Content-Type":"application/json", "User-Agent":"DunelmStockMonitor/2.0"})
+    with urlopen(req, timeout=20) as r:
+        if r.status not in (200, 204):
+            raise RuntimeError(f"Discord returned HTTP {r.status}")
+
+
+def normalise(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip().lower()
+
+
+def detect_with_browser(url: str) -> tuple[bool | None, str, str]:
+    DIAG_DIR.mkdir(exist_ok=True)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            locale="en-GB",
+            timezone_id="Europe/London",
+            viewport={"width": 1440, "height": 1200},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+        )
+        page = context.new_page()
+        response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        if response and response.status >= 400:
+            raise RuntimeError(f"Dunelm returned HTTP {response.status}")
         try:
-            req = Request(url, headers=headers)
-            with urlopen(req, timeout=30) as response:
-                html = response.read().decode("utf-8", errors="replace")
-                if response.status != 200:
-                    raise RuntimeError(f"HTTP {response.status}")
-                if len(html) < 20_000:
-                    raise RuntimeError(f"Page unexpectedly short ({len(html)} bytes)")
-                return html
-        except (HTTPError, URLError, TimeoutError, RuntimeError) as exc:
-            last_error = exc
-            if attempt < attempts:
-                time.sleep(attempt * 3)
-    raise RuntimeError(f"Could not download {url}: {last_error}")
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_timeout(5000)
 
+        title = page.title()
+        body_text = normalise(page.locator("body").inner_text(timeout=15000))
+        html = page.content()
 
-def visible_text(html: str) -> str:
-    text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html)
-    text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
-    text = unescape(text)
-    return re.sub(r"\s+", " ", text).strip().lower()
+        # Save diagnostics on every run; workflow only uploads them on failure.
+        page.screenshot(path=str(DIAG_DIR / "dunelm-page.png"), full_page=True)
+        (DIAG_DIR / "dunelm-page.html").write_text(html, encoding="utf-8")
+        (DIAG_DIR / "dunelm-body.txt").write_text(body_text, encoding="utf-8")
 
+        if "access denied" in normalise(title) or "access denied" in body_text[:1000]:
+            browser.close()
+            raise RuntimeError("Dunelm returned an Access Denied page")
 
-def detect_stock(html: str) -> tuple[bool | None, str]:
-    raw = html.lower()
-    text = visible_text(html)
+        positive_phrases = [
+            "add to basket", "add to bag", "available for delivery",
+            "available for home delivery", "choose delivery", "in stock"
+        ]
+        negative_phrases = [
+            "out of stock", "currently unavailable", "unavailable online",
+            "notify me when back in stock", "email me when back in stock"
+        ]
 
-    # Strong structured-data signals, when supplied by the product page.
-    positive_raw = [
-        '"availability":"https://schema.org/instock"',
-        '"availability": "https://schema.org/instock"',
-        'schema.org/instock',
-        '"stockstatus":"instock"',
-        '"stockstatus": "instock"',
-    ]
-    negative_raw = [
-        '"availability":"https://schema.org/outofstock"',
-        '"availability": "https://schema.org/outofstock"',
-        'schema.org/outofstock',
-        '"stockstatus":"outofstock"',
-        '"stockstatus": "outofstock"',
-    ]
+        # Prefer visible, enabled purchase buttons.
+        button_details: list[str] = []
+        for selector in ["button", "[role=button]", "input[type=submit]"]:
+            loc = page.locator(selector)
+            count = min(loc.count(), 200)
+            for i in range(count):
+                el = loc.nth(i)
+                try:
+                    text = normalise(el.inner_text(timeout=1000) or el.get_attribute("value") or "")
+                    if not text:
+                        continue
+                    if any(p in text for p in positive_phrases):
+                        enabled = el.is_enabled() and el.is_visible()
+                        button_details.append(f"{text} (enabled={enabled})")
+                        if enabled:
+                            browser.close()
+                            return True, f"enabled purchase control: {text}", body_text
+                except Exception:
+                    continue
 
-    # Strong visible purchase signals. Keep these specific to avoid matching
-    # generic help/footer wording.
-    positive_text = [
-        "add to basket",
-        "add to bag",
-        "available for home delivery",
-        "choose a delivery date",
-    ]
-    negative_text = [
-        "out of stock",
-        "currently unavailable",
-        "this product is unavailable",
-        "email me when back in stock",
-        "notify me when back in stock",
-    ]
+        # Structured availability is useful if present after rendering.
+        raw = html.lower()
+        if "schema.org/instock" in raw or '"availability":"instock"' in raw:
+            browser.close()
+            return True, "structured availability: InStock", body_text
+        if "schema.org/outofstock" in raw or '"availability":"outofstock"' in raw:
+            browser.close()
+            return False, "structured availability: OutOfStock", body_text
 
-    for signal in positive_raw:
-        if signal in raw:
-            return True, f"structured signal: {signal}"
-    for signal in negative_raw:
-        if signal in raw:
-            return False, f"structured signal: {signal}"
+        # Visible negative status takes precedence over generic page wording.
+        for phrase in negative_phrases:
+            if phrase in body_text:
+                browser.close()
+                return False, f"visible status: {phrase}", body_text
 
-    for signal in positive_text:
-        if signal in text:
-            return True, f"visible signal: {signal}"
-    for signal in negative_text:
-        if signal in text:
-            return False, f"visible signal: {signal}"
+        # Fallback positive wording only where the page visibly presents it.
+        for phrase in positive_phrases:
+            if phrase in body_text:
+                browser.close()
+                return True, f"visible status: {phrase}", body_text
 
-    # Dunelm may render availability with JavaScript. Do not guess from the
-    # absence of a button: unknown is safer than a false alert.
-    return None, "no recognised stock signal found"
-
-
-def send_discord(webhook_url: str, content: str, username: str) -> None:
-    payload = json.dumps({"username": username, "content": content}).encode("utf-8")
-    req = Request(
-        webhook_url,
-        data=payload,
-        headers={"Content-Type": "application/json", "User-Agent": "DunelmStockMonitor/1.0"},
-        method="POST",
-    )
-    with urlopen(req, timeout=20) as response:
-        if response.status not in (200, 204):
-            raise RuntimeError(f"Discord returned HTTP {response.status}")
+        details = "; ".join(button_details[:10]) or "no matching purchase controls"
+        browser.close()
+        return None, f"no reliable stock signal; {details}", body_text
 
 
 def main() -> int:
     print(VERSION)
-    config = load_json(CONFIG_PATH)
-    state = load_json(STATE_PATH)
+    cfg, state = load_json(CONFIG_PATH), load_json(STATE_PATH)
     webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-    test_mode = os.environ.get("TEST_NOTIFICATION", "false").lower() == "true"
-
+    test = os.environ.get("TEST_NOTIFICATION", "false").lower() == "true"
     if not webhook:
         raise RuntimeError("DISCORD_WEBHOOK_URL secret is missing")
 
-    name = config["product_name"]
-    url = config["product_url"]
-    username = config.get("discord_username", "Dunelm Stock Monitor")
-
-    if test_mode:
-        send_discord(webhook, f"✅ **Dunelm monitor test successful**\n{name}\n<{url}>", username)
-        print("Test notification sent; website was not checked.")
+    name, url = cfg["product_name"], cfg["product_url"]
+    username = cfg.get("discord_username", "Dunelm Stock Monitor")
+    if test:
+        send_discord(webhook, f"✅ **Dunelm V2 monitor test successful**\n**{name}**\n<{url}>", username)
+        print("Test notification sent.")
         return 0
 
-    html = fetch(url)
-    in_stock, reason = detect_stock(html)
-    print(f"Detection result: {in_stock}; {reason}")
-
-    if in_stock is None:
-        raise RuntimeError(
-            "Dunelm page loaded, but its stock status could not be identified safely. "
-            "The website may have changed or may require browser rendering."
-        )
+    current, reason, _ = detect_with_browser(url)
+    print(f"Detection result: {current}; {reason}")
+    if current is None:
+        raise RuntimeError(f"Could not identify Dunelm stock status: {reason}")
 
     previous = state.get("in_stock")
     initialised = bool(state.get("initialised"))
+    should_alert = (initialised and previous is False and current is True) or (
+        not initialised and current is True and cfg.get("notify_if_initially_in_stock", True)
+    )
 
-    if not initialised:
-        state.update({"initialised": True, "in_stock": in_stock, "last_status": "in_stock" if in_stock else "out_of_stock"})
-        save_json(STATE_PATH, state)
-        print(f"Initial baseline saved: {'IN STOCK' if in_stock else 'OUT OF STOCK'}. No alert sent.")
-        return 0
-
-    if previous is False and in_stock is True:
-        send_discord(
-            webhook,
-            f"🚨 **DUNELM RESTOCK DETECTED**\n**{name}**\nPrice shown: **£400**\n🟢 **In stock / purchasable**\n<{url}>",
-            username,
-        )
-        print("Restock alert sent.")
+    if should_alert:
+        label = "CURRENTLY IN STOCK" if not initialised else "RESTOCK DETECTED"
+        send_discord(webhook,
+            f"🚨 **DUNELM {label}**\n**{name}**\n🟢 **Available to purchase**\nDetected by: `{reason}`\n<{url}>",
+            username)
+        print("Stock alert sent.")
     else:
-        print(f"No restock transition. Previous={previous}, current={in_stock}")
+        print(f"No alert required. Previous={previous}, current={current}, initialised={initialised}")
 
-    state.update({"initialised": True, "in_stock": in_stock, "last_status": "in_stock" if in_stock else "out_of_stock"})
+    state.update({
+        "initialised": True,
+        "in_stock": current,
+        "last_status": "in_stock" if current else "out_of_stock",
+        "last_reason": reason,
+        "last_checked_utc": datetime.now(timezone.utc).isoformat(),
+    })
     save_json(STATE_PATH, state)
     return 0
 
