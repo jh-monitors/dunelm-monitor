@@ -1,5 +1,5 @@
 {
-  "initialised": false,
-  "in_stock": null,
-  "last_status": "unknown"
+  "in_stock": false,
+  "initialised": true,
+  "last_status": "out_of_stock"
 }
