@@ -1,6 +1,6 @@
 {
   "product_name": "12000 4 in 1 Portable Air Cooler and Heater",
   "product_url": "https://www.dunelm.com/product/12000-4-in-1-portable-air-cooler-and-heater-1000283539",
-  "check_interval_note": "Scheduled approximately every 5 minutes by GitHub Actions",
-  "discord_username": "Dunelm Stock Monitor"
+  "discord_username": "Dunelm Stock Monitor",
+  "notify_if_initially_in_stock": true
 }
