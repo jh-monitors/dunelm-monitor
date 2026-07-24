@@ -1,4 +1,4 @@
-name: Dunelm Stock Monitor V2
+name: Dunelm Stock Monitor V3
 
 on:
   schedule:
@@ -15,7 +15,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: dunelm-stock-monitor-v2
+  group: dunelm-stock-monitor-v3
   cancel-in-progress: false
 
 jobs:
@@ -29,19 +29,21 @@ jobs:
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
       - name: Check Dunelm and notify Discord
+        id: check
+        continue-on-error: true
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TEST_NOTIFICATION: ${{ inputs.test_notification || 'false' }}
         run: python monitor.py
-      - name: Upload diagnostics on failure
-        if: failure()
+      - name: Upload diagnostics when detection is uncertain
+        if: steps.check.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: dunelm-diagnostics
+          name: dunelm-diagnostics-${{ github.run_number }}
           path: diagnostics/
           retention-days: 7
       - name: Save stock state
-        if: success() && env.TEST_NOTIFICATION != 'true'
+        if: env.TEST_NOTIFICATION != 'true'
         env:
           TEST_NOTIFICATION: ${{ inputs.test_notification || 'false' }}
         run: |
@@ -54,3 +56,8 @@ jobs:
           git add state.json
           git commit -m "Update Dunelm stock state"
           git push
+      - name: Report uncertain detection
+        if: steps.check.outcome == 'failure'
+        run: |
+          echo "Dunelm did not expose a reliable stock signal. Diagnostics were uploaded."
+          exit 1
